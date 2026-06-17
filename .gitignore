@@ -6,6 +6,7 @@
 _build/
 docs-repo-template-main/
 results/
+results.csv
 build/
 rocSHMEM/
 *.sif
