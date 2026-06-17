@@ -5,28 +5,6 @@
 """
 Proton intra-kernel profiling demo for ``all_gather_matmul_hbm_buffer``.
 
-Goal
-----
-Prove that Triton's Proton instrumentation backend can produce the same kind
-of stacked Gantt chart that iris's built-in device tracing produces today
-(``iris/host/tracing/core.py``), but via the lightweight tritonBLAS-style
-``pl.scope`` markers compiled into the kernel — zero device-side atomics or
-buffers when ``profile=False``.
-
-What this script does
----------------------
-1. Launches the example-local ``all_gather_matmul_hbm_buffer_proton`` wrapper
-   with ``profile=True``,
-   which gates a ``proton.start(..., data="trace", backend="instrumentation")``
-   session around the kernel launch. Proton writes
-   ``hbm_buffer_all_gather_matmul.chrome_trace`` (standard Chrome Trace Event
-   Format JSON, Perfetto-loadable).
-2. Reads that JSON back and renders a matplotlib ``broken_barh`` Gantt with
-   one row per workgroup, bars colored by scope name. Saves
-   ``hbm_buffer_gantt.png`` next to the script.
-3. Also runs once with ``profile_format="tree"`` to emit
-   ``hbm_buffer_all_gather_matmul.hatchet`` for ``proton-viewer``.
-
 Run
 ---
 ::
@@ -34,18 +12,11 @@ Run
     python examples/33_proton_all_gather_matmul_gantt/profile_and_plot_gantt.py \\
         --num_ranks 8
 
-Uses ``torch.multiprocessing.spawn`` (same pattern as
-``examples/21_gemm_one_shot_all_reduce_independent/benchmark.py``) so no
-torchrun wrapper is needed.
-
 The Gantt PNG and chrome_trace are written next to the script. The
 chrome_trace is the apples-to-apples equivalent of iris's
 ``ctx.tracing.export(...)`` output — drop it into https://ui.perfetto.dev for
 the same browser-rendered timeline iris users see today.
 
-Add ``--tritonparse`` alongside ``--mode {proton,iris}`` to also capture
-Triton compile-time IR (TTIR/TTGIR/LLIR/AMDGCN) and launch metadata for
-viewing in https://meta-pytorch.org/tritonparse/.
 """
 
 import argparse
