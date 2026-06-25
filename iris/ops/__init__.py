@@ -37,6 +37,7 @@ from .workspace import FusedWorkspace
 from .matmul_all_reduce import matmul_all_reduce, matmul_all_reduce_preamble
 from .all_gather_matmul import all_gather_matmul, all_gather_matmul_preamble
 from .all_gather_matmul_hbm_buffer import all_gather_matmul_hbm_buffer, all_gather_matmul_hbm_buffer_preamble
+from .all_gather_matmul_layout import all_gather_matmul_layout, all_gather_matmul_layout_preamble
 from .matmul_all_gather import matmul_all_gather
 from .matmul_reduce_scatter import matmul_reduce_scatter, matmul_reduce_scatter_preamble
 
@@ -116,6 +117,28 @@ class OpsNamespace:
         """
         return all_gather_matmul(self._shmem, output_tensor, A_sharded, B, bias, async_op, config, workspace)
 
+    def all_gather_matmul_layout(
+        self,
+        output_tensor,
+        A_sharded,
+        B,
+        bias=None,
+        async_op=False,
+        config=None,
+        workspace=None,
+        layout=None,
+        **kwargs,
+    ):
+        """
+        All-gather + matmul whose pid->tile schedule is driven by a hierarchical
+        ScheduleLayout. With layout=None, matches all_gather_matmul_hbm_buffer.
+
+        Computes: output = all_gather(A_sharded) @ B + bias
+        """
+        return all_gather_matmul_layout(
+            self._shmem, output_tensor, A_sharded, B, bias, async_op, config, workspace, layout, **kwargs
+        )
+
     def matmul_all_gather(self, output_tensor, A, B, bias=None, async_op=False, config=None, workspace=None):
         """
         Fused matrix multiplication and all-gather.
@@ -183,6 +206,8 @@ __all__ = [
     "all_gather_matmul_preamble",
     "all_gather_matmul_hbm_buffer",
     "all_gather_matmul_hbm_buffer_preamble",
+    "all_gather_matmul_layout",
+    "all_gather_matmul_layout_preamble",
     "matmul_all_gather",
     "matmul_reduce_scatter",
     "matmul_reduce_scatter_preamble",

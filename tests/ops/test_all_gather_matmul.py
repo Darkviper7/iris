@@ -20,7 +20,12 @@ from iris.ops.all_gather_matmul_hbm_buffer import (
     all_gather_matmul_hbm_buffer,
     all_gather_matmul_hbm_buffer_preamble,
 )
+from iris.ops.all_gather_matmul_layout import (
+    all_gather_matmul_layout,
+    all_gather_matmul_layout_preamble,
+)
 from iris.ops.config import FusedConfig
+from iris.ops.schedule_layout import make_layout
 
 
 def _make_reference(rank, world_size, M, K_local, N, dtype):
@@ -179,6 +184,122 @@ def test_all_gather_matmul_hbm_buffer(dtype, atol, rtol, M, K_local, N, staged_a
     assert torch.allclose(output, ref_output, atol=atol, rtol=rtol), (
         f"Rank {rank}: Max diff {max_diff}, expected < {atol} "
         f"(staged_a_layout={staged_a_layout}, M={M}, K_local={K_local}, N={N})"
+    )
+
+
+@pytest.mark.parametrize(
+    "dtype, atol, rtol",
+    [
+        (torch.float16, 1e-2, 1e-2),
+        (torch.bfloat16, 1e-2, 1e-2),
+    ],
+)
+@pytest.mark.parametrize(
+    # num_m_tiles = M // block_size_m (64) must be divisible by world_size for the
+    # co-located layout. These shapes work for world_size in {2,4,8}.
+    "M,K_local,N",
+    [
+        (512, 64, 128),
+        (1024, 128, 256),
+    ],
+)
+@pytest.mark.parametrize(
+    "staged_a_layout",
+    [
+        "k_contiguous",
+        "m_contiguous",
+    ],
+)
+def test_all_gather_matmul_layout(dtype, atol, rtol, M, K_local, N, staged_a_layout):
+    """Hierarchical layout-driven kernel vs torch all_gather + matmul reference.
+
+    The only comparison is functional correctness against torch; there is no
+    comparison to the legacy hbm_buffer kernel.
+    """
+    if not dist.is_initialized():
+        pytest.skip("torch.distributed not initialized")
+
+    heap_size = 2**33
+    ctx = iris.iris(heap_size)
+    rank = ctx.get_rank()
+    world_size = ctx.get_num_ranks()
+
+    K = K_local * world_size
+
+    A_sharded, B, ref_output = _make_reference(rank, world_size, M, K_local, N, dtype)
+
+    A_sharded_shmem = ctx.zeros((M, K_local), dtype=dtype)
+    A_sharded_shmem.copy_(A_sharded)
+    B_shmem = ctx.zeros((K, N), dtype=dtype)
+    B_shmem.copy_(B)
+    output = ctx.zeros((M, N), dtype=dtype)
+
+    ctx.barrier()
+
+    # num_xcds set to world_size so num_m_tiles is divisible by it for these shapes.
+    config = FusedConfig(block_size_m=64, block_size_n=64, block_size_k=32, num_xcds=world_size)
+
+    # layout=None -> default_layout derives a valid co-located hierarchical layout.
+    all_gather_matmul_layout(
+        ctx,
+        output,
+        A_sharded_shmem,
+        B_shmem,
+        config=config,
+        staged_a_layout=staged_a_layout,
+        trace=False,
+    )
+
+    torch.cuda.synchronize()
+    ctx.barrier()
+
+    max_diff = (output - ref_output).abs().max().item()
+    assert torch.allclose(output, ref_output, atol=atol, rtol=rtol), (
+        f"Rank {rank}: Max diff {max_diff}, expected < {atol} "
+        f"(staged_a_layout={staged_a_layout}, M={M}, K_local={K_local}, N={N})"
+    )
+
+
+@pytest.mark.parametrize("order", ["kfg", "mtile"])
+@pytest.mark.parametrize("fetch_xcds", [None, 1, 2])
+def test_all_gather_matmul_layout_schedule_modes(order, fetch_xcds):
+    """The new schedule knobs (FetcherLayout.order, XCDLayout.fetch_xcds) must each
+    produce correct output vs the torch all_gather+mm reference. Co-located
+    (fetch_xcds=None) and spatial role-segregated layouts are both checked."""
+    if not dist.is_initialized():
+        pytest.skip("torch.distributed not initialized")
+
+    dtype, atol, rtol = torch.float16, 1e-2, 1e-2
+    M, K_local, N = 1024, 128, 256
+    ctx = iris.iris(2**33)
+    rank = ctx.get_rank()
+    world_size = ctx.get_num_ranks()
+    K = K_local * world_size
+    num_xcds = world_size  # so num_m_tiles (16) is divisible by num_xcds
+
+    if fetch_xcds is not None and not (1 <= fetch_xcds < num_xcds):
+        pytest.skip(f"fetch_xcds={fetch_xcds} invalid for num_xcds={num_xcds}")
+
+    A_sharded, B, ref_output = _make_reference(rank, world_size, M, K_local, N, dtype)
+    A_shmem = ctx.zeros((M, K_local), dtype=dtype); A_shmem.copy_(A_sharded)
+    B_shmem = ctx.zeros((K, N), dtype=dtype); B_shmem.copy_(B)
+    output = ctx.zeros((M, N), dtype=dtype)
+    ctx.barrier()
+
+    bm, bn, bk = 64, 64, 32
+    config = FusedConfig(block_size_m=bm, block_size_n=bn, block_size_k=bk, num_xcds=num_xcds)
+    layout, _ = make_layout(
+        fetch_m=1, fetch_k=2, group_m=1, num_xcds=num_xcds,
+        block_size_m=bm, block_size_n=bn, block_size_k=bk,
+        M=M, N=N, K=K, K_local=K_local, world_size=world_size,
+        order=order, fetch_xcds=fetch_xcds,
+    )
+    all_gather_matmul_layout(ctx, output, A_shmem, B_shmem, config=config, layout=layout)
+    torch.cuda.synchronize(); ctx.barrier()
+
+    max_diff = (output - ref_output).abs().max().item()
+    assert torch.allclose(output, ref_output, atol=atol, rtol=rtol), (
+        f"Rank {rank}: max_diff {max_diff} (order={order}, fetch_xcds={fetch_xcds})"
     )
 
 

@@ -6,7 +6,7 @@ Configuration for fused GEMM+CCL operations.
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 
 @dataclass
@@ -61,6 +61,10 @@ class FusedConfig:
     # CCL-specific parameters
     all_reduce_variant: str = "two_shot"  # atomic, ring, one_shot, two_shot, spinlock
     all_reduce_num_rings: int = 1
+
+    # Optional hierarchical scheduling layout (ScheduleLayout) for the
+    # layout-driven all_gather_matmul kernel. None -> derive from sweep heuristics.
+    schedule_layout: Optional[Any] = None
 
     def validate(self, world_size: Optional[int] = None):
         """
