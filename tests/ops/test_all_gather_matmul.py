@@ -24,6 +24,7 @@ from iris.ops.all_gather_matmul_layout import (
     all_gather_matmul_layout,
     all_gather_matmul_layout_preamble,
 )
+from iris.ops.all_gather_matmul_fused_a8x8 import all_gather_matmul_fused_a8x8
 from iris.ops.config import FusedConfig
 from iris.ops.schedule_layout import make_layout
 
@@ -260,6 +261,81 @@ def test_all_gather_matmul_layout(dtype, atol, rtol, M, K_local, N, staged_a_lay
     )
 
 
+@pytest.mark.parametrize("credit_window", [1, 2, 4])
+def test_all_gather_matmul_layout_credit_window(credit_window):
+    """TCP-style credit window (bounded producer run-ahead) must stay correct and
+    NOT deadlock. Co-located layout with small co-resident pools (n_fetch_wg +
+    n_gemm_wg <= cus_per_xcd) so the fetcher's throttle-wait on consumer credit can
+    always make progress. Compared to the torch all_gather + matmul reference."""
+    if not dist.is_initialized():
+        pytest.skip("torch.distributed not initialized")
+
+    dtype, atol, rtol = torch.float16, 1e-2, 1e-2
+    M, K_local, N = 1024, 128, 256
+    ctx = iris.iris(2**33)
+    rank = ctx.get_rank()
+    world_size = ctx.get_num_ranks()
+    K = K_local * world_size
+    num_xcds = world_size  # num_m_tiles (16) divisible by num_xcds
+
+    A_sharded, B, ref_output = _make_reference(rank, world_size, M, K_local, N, dtype)
+    A_shmem = ctx.zeros((M, K_local), dtype=dtype); A_shmem.copy_(A_sharded)
+    B_shmem = ctx.zeros((K, N), dtype=dtype); B_shmem.copy_(B)
+    output = ctx.zeros((M, N), dtype=dtype)
+    ctx.barrier()
+
+    config = FusedConfig(block_size_m=64, block_size_n=64, block_size_k=32, num_xcds=num_xcds)
+    # small pools -> fetcher + GEMM WGs co-reside per XCD (deadlock-safe throttle).
+    all_gather_matmul_layout(
+        ctx, output, A_shmem, B_shmem,
+        config=config,
+        n_fetch_wg=2, n_gemm_wg=8,
+        credit_window=credit_window,
+        cus_per_xcd=38,
+    )
+    torch.cuda.synchronize(); ctx.barrier()
+
+    max_diff = (output - ref_output).abs().max().item()
+    assert torch.allclose(output, ref_output, atol=atol, rtol=rtol), (
+        f"Rank {rank}: credit_window={credit_window} max diff {max_diff} >= {atol}"
+    )
+
+
+def test_all_gather_matmul_layout_credit_window_rejects_spatial():
+    """credit_window must be rejected (clean error, no hang) for spatial layouts where
+    producer and consumer live on different XCDs."""
+    if not dist.is_initialized():
+        pytest.skip("torch.distributed not initialized")
+    world_size = iris.iris(2**33).get_num_ranks()
+    if world_size < 2:
+        pytest.skip("spatial layout needs world_size >= 2")
+
+    dtype = torch.float16
+    M, K_local, N = 1024, 128, 256
+    ctx = iris.iris(2**33)
+    rank = ctx.get_rank()
+    K = K_local * world_size
+    num_xcds = world_size
+
+    A_sharded, B, _ = _make_reference(rank, world_size, M, K_local, N, dtype)
+    A_shmem = ctx.zeros((M, K_local), dtype=dtype); A_shmem.copy_(A_sharded)
+    B_shmem = ctx.zeros((K, N), dtype=dtype); B_shmem.copy_(B)
+    output = ctx.zeros((M, N), dtype=dtype)
+    ctx.barrier()
+
+    bm, bn, bk = 64, 64, 32
+    config = FusedConfig(block_size_m=bm, block_size_n=bn, block_size_k=bk, num_xcds=num_xcds)
+    layout, _ = make_layout(
+        fetch_m=1, fetch_k=2, group_m=1, num_xcds=num_xcds,
+        block_size_m=bm, block_size_n=bn, block_size_k=bk,
+        M=M, N=N, K=K, K_local=K_local, world_size=world_size,
+        order="mtile", fetch_xcds=1,
+    )
+    with pytest.raises(ValueError, match="co-located"):
+        all_gather_matmul_layout(ctx, output, A_shmem, B_shmem, config=config,
+                                 layout=layout, credit_window=2)
+
+
 @pytest.mark.parametrize("order", ["kfg", "mtile"])
 @pytest.mark.parametrize("fetch_xcds", [None, 1, 2])
 def test_all_gather_matmul_layout_schedule_modes(order, fetch_xcds):
@@ -300,6 +376,315 @@ def test_all_gather_matmul_layout_schedule_modes(order, fetch_xcds):
     max_diff = (output - ref_output).abs().max().item()
     assert torch.allclose(output, ref_output, atol=atol, rtol=rtol), (
         f"Rank {rank}: max_diff {max_diff} (order={order}, fetch_xcds={fetch_xcds})"
+    )
+
+
+@pytest.mark.parametrize("order", ["mtile", "coop"])
+def test_all_gather_matmul_layout_local_interleave(order):
+    """skip_local_stage + local_interleave: the wait-free local flag-groups are spread
+    among the remote ones (new consumer ordering). Since matmul accumulation is
+    order-independent, output must still match torch all_gather+mm for both mtile and
+    coop fetch orders."""
+    if not dist.is_initialized():
+        pytest.skip("torch.distributed not initialized")
+    dtype, atol, rtol = torch.float16, 1e-2, 1e-2
+    M, K_local, N = 1024, 128, 256
+    ctx = iris.iris(2**33)
+    rank = ctx.get_rank()
+    world_size = ctx.get_num_ranks()
+    K = K_local * world_size
+    num_xcds = world_size
+
+    A_sharded, B, ref_output = _make_reference(rank, world_size, M, K_local, N, dtype)
+    A_shmem = ctx.zeros((M, K_local), dtype=dtype); A_shmem.copy_(A_sharded)
+    B_shmem = ctx.zeros((K, N), dtype=dtype); B_shmem.copy_(B)
+    output = ctx.zeros((M, N), dtype=dtype)
+    ctx.barrier()
+
+    bm, bn, bk = 64, 64, 32
+    # fetch_k=2 with K_local/bk = 128/32 = 4 local k-blocks -> FLAGS_PER_RANK=2 local
+    # flag-groups to interleave among the remote ones (num_k_blocks_local % fetch_k==0).
+    config = FusedConfig(block_size_m=bm, block_size_n=bn, block_size_k=bk, num_xcds=num_xcds)
+    # co-located (fetch_xcds=None) for both orders; coop strides the remote-only flag
+    # list, which is exactly the skip_local regime (cf. the w4k_coloc coop configs).
+    layout, _ = make_layout(
+        fetch_m=1, fetch_k=2, group_m=1, num_xcds=num_xcds,
+        block_size_m=bm, block_size_n=bn, block_size_k=bk,
+        M=M, N=N, K=K, K_local=K_local, world_size=world_size,
+        order=order, fetch_xcds=None,
+    )
+    all_gather_matmul_layout(ctx, output, A_shmem, B_shmem, config=config, layout=layout,
+                             skip_local_stage=True, local_interleave=True)
+    torch.cuda.synchronize(); ctx.barrier()
+
+    max_diff = (output - ref_output).abs().max().item()
+    assert torch.allclose(output, ref_output, atol=atol, rtol=rtol), (
+        f"Rank {rank}: local_interleave max_diff {max_diff} (order={order})"
+    )
+
+
+# Exercise the in-kernel pid->tile DECODE arithmetic across every branch that the
+# basic schedule-modes test above does not: non-full WG pools (strided loops),
+# fetch_m>1 (the m-footprint multiply), local_first order, and both role modes.
+# Output==ref only stays correct if the kernel decode covers each tile EXACTLY
+# once, so any drift between the kernel decode (all_gather_matmul_layout.py) and the
+# host ScheduleLayout.decode surfaces here as a wrong result. make_layout.validate()
+# already checks host-side exactly-once coverage; this asserts the KERNEL agrees.
+@pytest.mark.parametrize(
+    "order,fetch_xcds,fetch_m,n_fetch_wg,n_gemm_wg",
+    [
+        # co-located, small pools (strided fetch + gemm loops)
+        ("mtile", None, 1, 4, 16),
+        ("kfg",   None, 1, 8, 8),
+        # co-located, fetch_m>1 (footprint walks 2 m-tiles per cell)
+        ("mtile", None, 2, 4, 16),
+        # local_first order (rank-rotated kfg dispatch)
+        ("local_first", None, 1, 8, 16),
+        # spatial, small per-role pools (strided over the GLOBAL space)
+        ("mtile", 2, 1, 8, 16),
+        ("mtile", 1, 1, 16, 32),
+        # spatial + fetch_m>1
+        ("mtile", 2, 2, 8, 16),
+    ],
+)
+def test_all_gather_matmul_layout_decode_coverage(order, fetch_xcds, fetch_m, n_fetch_wg, n_gemm_wg):
+    """Kernel decode must match host ScheduleLayout for pools, fetch_m, and order
+    variants — a wrong tile->WG mapping shows up as output != torch reference."""
+    if not dist.is_initialized():
+        pytest.skip("torch.distributed not initialized")
+
+    dtype, atol, rtol = torch.float16, 1e-2, 1e-2
+    M, K_local, N = 1024, 128, 256
+    ctx = iris.iris(2**33)
+    rank = ctx.get_rank()
+    world_size = ctx.get_num_ranks()
+    K = K_local * world_size
+    num_xcds = world_size  # num_m_tiles (16) divisible by num_xcds
+
+    if fetch_xcds is not None and not (1 <= fetch_xcds < num_xcds):
+        pytest.skip(f"fetch_xcds={fetch_xcds} invalid for num_xcds={num_xcds}")
+
+    A_sharded, B, ref_output = _make_reference(rank, world_size, M, K_local, N, dtype)
+    A_shmem = ctx.zeros((M, K_local), dtype=dtype); A_shmem.copy_(A_sharded)
+    B_shmem = ctx.zeros((K, N), dtype=dtype); B_shmem.copy_(B)
+    output = ctx.zeros((M, N), dtype=dtype)
+    ctx.barrier()
+
+    bm, bn, bk = 64, 64, 32
+    config = FusedConfig(block_size_m=bm, block_size_n=bn, block_size_k=bk, num_xcds=num_xcds)
+    try:
+        layout, _ = make_layout(
+            fetch_m=fetch_m, fetch_k=2, group_m=1, num_xcds=num_xcds,
+            block_size_m=bm, block_size_n=bn, block_size_k=bk,
+            M=M, N=N, K=K, K_local=K_local, world_size=world_size,
+            order=order, fetch_xcds=fetch_xcds,
+            n_fetch_wg=n_fetch_wg, n_gemm_wg=n_gemm_wg,
+        )
+    except AssertionError as e:
+        pytest.skip(f"invalid layout for this shape: {e}")
+
+    all_gather_matmul_layout(ctx, output, A_shmem, B_shmem, config=config, layout=layout)
+    torch.cuda.synchronize(); ctx.barrier()
+
+    max_diff = (output - ref_output).abs().max().item()
+    assert torch.allclose(output, ref_output, atol=atol, rtol=rtol), (
+        f"Rank {rank}: max_diff {max_diff} "
+        f"(order={order}, fetch_xcds={fetch_xcds}, fetch_m={fetch_m}, "
+        f"nfw={n_fetch_wg}, ngw={n_gemm_wg})"
+    )
+
+
+# skip_local_stage: cur_rank's own shard is never staged; the GEMM reads it from
+# A_sharded and computes it local-first (no flag wait). Output must still equal the
+# torch reference. Also covers the auto-disable path (fetch_k straddling a rank).
+@pytest.mark.parametrize(
+    "order,fetch_xcds,fetch_k",
+    [
+        ("mtile", None, 2),   # co-located, flag-group within rank
+        ("mtile", 2, 2),      # spatial fetch-only XCDs
+        ("kfg", None, 2),     # kfg order
+        ("mtile", None, 4),   # fetch_k == num_k_blocks_local -> 1 flag-group/rank
+    ],
+)
+def test_all_gather_matmul_layout_skip_local_stage(order, fetch_xcds, fetch_k):
+    """skip_local_stage must produce output == torch all_gather+mm reference."""
+    if not dist.is_initialized():
+        pytest.skip("torch.distributed not initialized")
+
+    dtype, atol, rtol = torch.float16, 1e-2, 1e-2
+    M, K_local, N = 1024, 128, 256
+    ctx = iris.iris(2**33)
+    rank = ctx.get_rank()
+    world_size = ctx.get_num_ranks()
+    K = K_local * world_size
+    num_xcds = world_size
+
+    if fetch_xcds is not None and not (1 <= fetch_xcds < num_xcds):
+        pytest.skip(f"fetch_xcds={fetch_xcds} invalid for num_xcds={num_xcds}")
+
+    A_sharded, B, ref_output = _make_reference(rank, world_size, M, K_local, N, dtype)
+    A_shmem = ctx.zeros((M, K_local), dtype=dtype); A_shmem.copy_(A_sharded)
+    B_shmem = ctx.zeros((K, N), dtype=dtype); B_shmem.copy_(B)
+    output = ctx.zeros((M, N), dtype=dtype)
+    ctx.barrier()
+
+    bm, bn, bk = 64, 64, 32
+    config = FusedConfig(block_size_m=bm, block_size_n=bn, block_size_k=bk, num_xcds=num_xcds)
+    try:
+        layout, _ = make_layout(
+            fetch_m=1, fetch_k=fetch_k, group_m=1, num_xcds=num_xcds,
+            block_size_m=bm, block_size_n=bn, block_size_k=bk,
+            M=M, N=N, K=K, K_local=K_local, world_size=world_size,
+            order=order, fetch_xcds=fetch_xcds,
+        )
+    except AssertionError as e:
+        pytest.skip(f"invalid layout for this shape: {e}")
+
+    all_gather_matmul_layout(
+        ctx, output, A_shmem, B_shmem, config=config, layout=layout,
+        skip_local_stage=True,
+    )
+    torch.cuda.synchronize(); ctx.barrier()
+
+    max_diff = (output - ref_output).abs().max().item()
+    assert torch.allclose(output, ref_output, atol=atol, rtol=rtol), (
+        f"Rank {rank}: max_diff {max_diff} "
+        f"(order={order}, fetch_xcds={fetch_xcds}, fetch_k={fetch_k})"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Dynamic work-stealing GEMM (work_steal=True)
+# ──────────────────────────────────────────────────────────────────────
+@pytest.mark.parametrize(
+    "fetch_xcds,n_fetch_wg,n_gemm_wg,skip_local",
+    [
+        (None, 4, 16, False),  # co-located, small pools (owners + thieves)
+        (None, 8, 8, False),   # co-located, larger fetch pool
+        (None, 4, 16, True),   # co-located + skip_local_stage (local-first compute)
+        (2, 8, 16, False),     # spatial: drained fetch XCDs steal cross-XCD
+        (2, 8, 16, True),      # spatial + skip_local: cross-XCD thief on local-first path
+    ],
+)
+def test_all_gather_matmul_layout_work_steal(fetch_xcds, n_fetch_wg, n_gemm_wg, skip_local):
+    """Unified dynamic work-stealing GEMM must produce output == torch all_gather+mm.
+    ALL GEMM WGs and drained fetch WGs pull tile chunks from one atomic counter over the
+    full tile space (per-XCD co-located / global spatial); exactly-once by the monotonic
+    counter (disjoint chunks). Covers co-located + spatial, small pools, and skip_local
+    (incl. spatial+skip_local: cross-XCD drainer on the local-first path)."""
+    if not dist.is_initialized():
+        pytest.skip("torch.distributed not initialized")
+
+    dtype, atol, rtol = torch.float16, 1e-2, 1e-2
+    M, K_local, N = 1024, 128, 256
+    ctx = iris.iris(2**33)
+    rank = ctx.get_rank()
+    world_size = ctx.get_num_ranks()
+    K = K_local * world_size
+    num_xcds = world_size  # num_m_tiles (16) divisible by num_xcds
+
+    if fetch_xcds is not None and not (1 <= fetch_xcds < num_xcds):
+        pytest.skip(f"fetch_xcds={fetch_xcds} invalid for num_xcds={num_xcds}")
+
+    A_sharded, B, ref_output = _make_reference(rank, world_size, M, K_local, N, dtype)
+    A_shmem = ctx.zeros((M, K_local), dtype=dtype); A_shmem.copy_(A_sharded)
+    B_shmem = ctx.zeros((K, N), dtype=dtype); B_shmem.copy_(B)
+    output = ctx.zeros((M, N), dtype=dtype)
+    ctx.barrier()
+
+    bm, bn, bk = 64, 64, 32
+    config = FusedConfig(block_size_m=bm, block_size_n=bn, block_size_k=bk, num_xcds=num_xcds)
+    try:
+        layout, _ = make_layout(
+            fetch_m=1, fetch_k=2, group_m=1, num_xcds=num_xcds,
+            block_size_m=bm, block_size_n=bn, block_size_k=bk,
+            M=M, N=N, K=K, K_local=K_local, world_size=world_size,
+            order="mtile", fetch_xcds=fetch_xcds,
+            n_fetch_wg=n_fetch_wg, n_gemm_wg=n_gemm_wg,
+        )
+    except AssertionError as e:
+        pytest.skip(f"invalid layout for this shape: {e}")
+
+    all_gather_matmul_layout(
+        ctx, output, A_shmem, B_shmem, config=config, layout=layout,
+        work_steal=True, skip_local_stage=skip_local,
+    )
+    torch.cuda.synchronize(); ctx.barrier()
+
+    max_diff = (output - ref_output).abs().max().item()
+    assert torch.allclose(output, ref_output, atol=atol, rtol=rtol), (
+        f"Rank {rank}: work_steal max_diff {max_diff} "
+        f"(fetch_xcds={fetch_xcds}, nfw={n_fetch_wg}, ngw={n_gemm_wg}, skip_local={skip_local})"
+    )
+
+
+def test_all_gather_matmul_layout_work_steal_default_off_matches():
+    """work_steal=False must give the SAME output as the baseline call with no
+    work_steal kwarg (default-off invariance at the API level)."""
+    if not dist.is_initialized():
+        pytest.skip("torch.distributed not initialized")
+
+    dtype, atol = torch.float16, 1e-2
+    M, K_local, N = 1024, 128, 256
+    ctx = iris.iris(2**33)
+    rank = ctx.get_rank()
+    world_size = ctx.get_num_ranks()
+    K = K_local * world_size
+    num_xcds = world_size
+
+    A_sharded, B, ref_output = _make_reference(rank, world_size, M, K_local, N, dtype)
+    A_shmem = ctx.zeros((M, K_local), dtype=dtype); A_shmem.copy_(A_sharded)
+    B_shmem = ctx.zeros((K, N), dtype=dtype); B_shmem.copy_(B)
+    out_base = ctx.zeros((M, N), dtype=dtype)
+    out_off = ctx.zeros((M, N), dtype=dtype)
+    ctx.barrier()
+
+    config = FusedConfig(block_size_m=64, block_size_n=64, block_size_k=32, num_xcds=num_xcds)
+    all_gather_matmul_layout(ctx, out_base, A_shmem, B_shmem, config=config)
+    all_gather_matmul_layout(ctx, out_off, A_shmem, B_shmem, config=config, work_steal=False)
+    torch.cuda.synchronize(); ctx.barrier()
+
+    assert torch.equal(out_base, out_off), (
+        f"Rank {rank}: work_steal=False output differs from the no-kwarg baseline"
+    )
+    assert torch.allclose(out_off, ref_output, atol=atol, rtol=atol)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_all_gather_matmul_layout_work_steal_gate_shape(dtype):
+    """Gate projection shape 4096x11008x4096 at ws4 with dynamic work-stealing on
+    a co-located schedule. This is the compute-bound regime work_steal targets."""
+    if not dist.is_initialized():
+        pytest.skip("torch.distributed not initialized")
+
+    ctx = iris.iris(2**34)
+    rank = ctx.get_rank()
+    world_size = ctx.get_num_ranks()
+    if world_size != 4:
+        pytest.skip("gate-shape work_steal test targets world_size == 4 (ws4)")
+
+    atol, rtol = 1e-2, 1e-2
+    M, N, K = 4096, 11008, 4096
+    K_local = K // world_size  # 1024
+
+    A_sharded, B, ref_output = _make_reference(rank, world_size, M, K_local, N, dtype)
+    A_shmem = ctx.zeros((M, K_local), dtype=dtype); A_shmem.copy_(A_sharded)
+    B_shmem = ctx.zeros((K, N), dtype=dtype); B_shmem.copy_(B)
+    output = ctx.zeros((M, N), dtype=dtype)
+    ctx.barrier()
+
+    # co-located default layout; small GEMM pool so the native owner ranges + steal
+    # protocol are exercised (rather than one WG per tile).
+    config = FusedConfig(block_size_m=128, block_size_n=256, block_size_k=64, num_xcds=world_size)
+    all_gather_matmul_layout(
+        ctx, output, A_shmem, B_shmem, config=config,
+        n_fetch_wg=8, n_gemm_wg=32, work_steal=True,
+    )
+    torch.cuda.synchronize(); ctx.barrier()
+
+    max_diff = (output - ref_output).abs().max().item()
+    assert torch.allclose(output, ref_output, atol=atol, rtol=rtol), (
+        f"Rank {rank}: gate-shape work_steal max_diff {max_diff}"
     )
 
 
@@ -610,6 +995,54 @@ def test_auto_config_block_k_always_64():
     for M in [1024, 4096, 16384]:
         config, *_ = _auto_config(M, 3584, 8192, world_size=8)
         assert config.block_size_k == 64, f"Expected block_k=64 for M={M}, got {config.block_size_k}"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Fully-fused 8x8 A-stationary schedule (all_gather_matmul_fused_a8x8)
+# ──────────────────────────────────────────────────────────────────────
+@pytest.mark.parametrize(
+    "M,K_local,N,bm,bn,cols",
+    [
+        # 2048x2048x2048 ws4: bm=128, bn=256, cols=8  (K_local=512)
+        (2048, 512, 2048, 128, 256, 8),
+        # 1024x1024x1024 ws4: bm=64, bn=128, cols=8  (K_local=256)
+        (1024, 256, 1024, 64, 128, 8),
+    ],
+)
+def test_all_gather_matmul_fused_a8x8(M, K_local, N, bm, bn, cols):
+    """8x8 A-stationary fully-fused kernel vs torch all_gather -> cat -> mm."""
+    if not dist.is_initialized():
+        pytest.skip("torch.distributed not initialized")
+    if not torch.cuda.is_available():
+        pytest.skip("no GPU available")
+
+    dtype, atol, rtol = torch.float16, 1e-2, 1e-2
+    ctx = iris.iris(2**33)
+    rank = ctx.get_rank()
+    world_size = ctx.get_num_ranks()
+    if world_size != 4:
+        pytest.skip("fused a8x8 test targets world_size == 4 (ws4)")
+
+    K = K_local * world_size
+    assert N % (bn * cols) == 0, f"bn*cols ({bn * cols}) must tile N ({N})"
+
+    A_sharded, B, ref_output = _make_reference(rank, world_size, M, K_local, N, dtype)
+    A_shmem = ctx.zeros((M, K_local), dtype=dtype); A_shmem.copy_(A_sharded)
+    B_shmem = ctx.zeros((K, N), dtype=dtype); B_shmem.copy_(B)
+    output = ctx.zeros((M, N), dtype=dtype)
+    ctx.barrier()
+
+    config = FusedConfig(block_size_m=bm, block_size_n=bn, block_size_k=64, num_xcds=8)
+    all_gather_matmul_fused_a8x8(
+        ctx, output, A_shmem, B_shmem, config=config, cols_per_xcd=cols, async_op=False
+    )
+    torch.cuda.synchronize(); ctx.barrier()
+
+    max_diff = (output - ref_output).abs().max().item()
+    assert torch.allclose(output, ref_output, atol=atol, rtol=rtol), (
+        f"Rank {rank}: fused a8x8 max_diff {max_diff} "
+        f"(M={M}, K_local={K_local}, N={N}, bm={bm}, bn={bn}, cols={cols})"
+    )
 
 
 if __name__ == "__main__":

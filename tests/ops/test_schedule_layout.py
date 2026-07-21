@@ -201,6 +201,42 @@ def test_default_layout_is_valid():
     assert layout.grid_size(problem) > 0
 
 
+def test_default_layout_defaults_reflect_winners():
+    """Zero-config default_layout should pick the winning-region defaults: m-tile
+    order and fetch_k<=16 (large-K shapes get fk16), co-located role mode."""
+    layout, problem = sl.default_layout(
+        M=4096, N=4096, K=4096, K_local=1024, world_size=4, num_xcds=8,
+        block_size_m=256, block_size_n=256, block_size_k=64,
+    )
+    ce = layout.constexprs(problem)
+    assert layout.xcd.cu.fetcher.order == sl.FETCH_ORDER_MTILE
+    assert ce["FETCH_ORDER"] == 1               # mtile
+    assert ce["FETCH_K"] == 16                  # num_k_blocks=64 -> largest divisor <=16
+    assert ce["FETCH_XCDS"] == 0                # co-located (safe general default)
+    # small-K shape: fetch_k cap can't exceed num_k_blocks
+    l2, p2 = sl.default_layout(M=1024, N=1024, K=1024, K_local=256, world_size=4,
+                              num_xcds=8, block_size_m=64, block_size_n=256, block_size_k=64)
+    assert l2.constexprs(p2)["FETCH_K"] == 16   # num_k_blocks=16 -> 16
+
+
+def test_enumerate_defaults_span_schedule_space():
+    """New enumerate_layouts defaults must cover BOTH orders and the full role set
+    (co-located + spatial 1..4), and stay bounded (not the pool-swept explosion)."""
+    cands = list(sl.enumerate_layouts(
+        4096, 4096, 4096, 1024, 4, num_xcds=8,
+        block_size_m=(256,), block_size_n=(256,), block_size_k=(64,),
+        fetch_k=(16,), fetch_m=(1,), group_m=(1,),
+        # order/fetch_xcds intentionally NOT passed -> exercise the new DEFAULTS
+    ))
+    orders = {c.layout.xcd.cu.fetcher.order for c in cands}
+    modes = {c.constexprs()["FETCH_XCDS"] for c in cands}
+    assert orders == {sl.FETCH_ORDER_KFG, sl.FETCH_ORDER_MTILE}
+    assert modes == {0, 1, 2, 3, 4}             # co-located + spatial 1..4
+    assert all(c.constexprs()["N_FETCH_WG"] >= 1 for c in cands)  # full-pool default valid
+    for c in cands:
+        c.layout.validate(c.problem)
+
+
 def test_bad_divisibility_raises():
     # num_m_tiles (3) not divisible by num_xcds (8)
     with pytest.raises(AssertionError):
@@ -316,3 +352,35 @@ def test_enumerate_includes_order_and_spatial():
     assert 0 in modes and 2 in modes
     for c in cands:  # every emitted candidate is valid
         c.layout.validate(c.problem)
+
+
+# ---------------------------------------------------------------------------
+# Scope A: nested compose() view must cover exactly the same fetch cells as
+# materialize() (the CuTe-style (CU-spatial x FetcherLayout) re-view is a
+# faithful re-description of the flat schedule, not a new schedule).
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("cfg", VALID_CONFIGS)
+def test_compose_matches_materialize_coverage(cfg):
+    layout, problem = _build(cfg)
+    # ground truth: the (m_tile, k_flag_group) pairs the fetchers actually gather,
+    # from the flat materialize() schedule.
+    truth = set()
+    for a in layout.materialize(problem):
+        if a.role == sl.ROLE_FETCH:
+            fm = layout.xcd.cu.fetcher.m
+            for di in range(fm):
+                truth.add((a.m_tile + di, a.k_flag_group))
+    # nested view
+    comp = layout.compose(problem)
+    seen = []
+    for pairs in comp["tiles"].values():
+        seen.extend(pairs)
+    seen_set = set(seen)
+    # 1. same SET of cells (coverage identical)
+    assert seen_set == truth, (
+        f"compose coverage != materialize: "
+        f"missing={truth - seen_set}, extra={seen_set - truth}")
+    # 2. exactly-once within the union across CU-slots (no duplicate gather work)
+    assert len(seen) == len(seen_set), "compose duplicated a fetch cell across CU-slots"
+    # 3. spatial pool size is the fetch WG pool
+    assert comp["spatial"] == layout.constexprs(problem)["N_FETCH_WG"]

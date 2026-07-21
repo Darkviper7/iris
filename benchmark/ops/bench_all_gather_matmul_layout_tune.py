@@ -65,6 +65,7 @@ import os
 
 import torch
 import torch.distributed as dist
+import iris
 import iris.bench as bench
 from iris.ops.all_gather_matmul_layout import (
     all_gather_matmul_layout,
@@ -198,6 +199,9 @@ _REF_CACHE = {}       # dtype -> reference output tensor (torch all_gather @ mm)
 #                       alongside the framework's L2-cleared do_bench number.
 _CHECK = os.environ.get("IRIS_TUNE_CHECK", "0") == "1"
 _WARM = os.environ.get("IRIS_TUNE_WARM", "0") == "1"
+# Skip staging cur_rank's own shard (GEMM reads it from A_sharded) + compute it
+# local-first. Auto-disabled per-shape when a flag-group straddles a rank boundary.
+_SKIP_LOCAL = os.environ.get("IRIS_TUNE_SKIP_LOCAL", "0") == "1"
 _ATOL = float(os.environ.get("IRIS_TUNE_ATOL", "1e-2"))
 _RTOL = float(os.environ.get("IRIS_TUNE_RTOL", "1e-2"))
 
@@ -300,6 +304,7 @@ def layout_tune(state, ctx):
         ctx, C, A_sharded, B,
         config=config, workspace=workspace, layout=layout,
         num_warps=cand.num_warps, num_stages=cand.num_stages,
+        skip_local_stage=_SKIP_LOCAL,
         async_op=True,
     )
 
@@ -354,6 +359,25 @@ def rccl_reference(state, ctx):
         dist.all_gather(A_gathered_list, A_sharded)
         A_gathered = torch.cat(A_gathered_list, dim=1)
         torch.mm(A_gathered, B, out=C)
+
+    # Phase breakdown (untimed setup; same L2-cleared do_bench the harness uses).
+    # RCCL runs comm-then-GEMM on one stream with NO overlap, so the two phase
+    # times sum to the combined total measured by state.exec below. We time them
+    # in isolation to show, on the slide, how much of RCCL's wall time is comm vs
+    # the pure-hipBLASLt GEMM (fp16 torch.mm lowers to hipBLASLt on ROCm).
+    A_gathered = torch.cat(A_gathered_list, dim=1)  # persistent buffer for GEMM-only
+
+    def _comm():
+        dist.all_gather(A_gathered_list, A_sharded)
+        torch.cat(A_gathered_list, dim=1, out=A_gathered)
+
+    def _gemm():
+        torch.mm(A_gathered, B, out=C)
+
+    comm_ms = iris.do_bench(_comm, barrier_fn=ctx.barrier)
+    gemm_ms = iris.do_bench(_gemm, barrier_fn=ctx.barrier)
+    state.add_counter("comm_ms", comm_ms)
+    state.add_counter("gemm_ms", gemm_ms)
 
     state.exec(_run)
 

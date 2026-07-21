@@ -41,6 +41,11 @@ EVENT_NAMES = {
     # User compute (2048–3071)
     2048: "compute",
     2049: "reduce",
+    2050: "gemm_read",
+    2051: "gemm_read_b",
+    2052: "gemm_store_c",
+    2053: "gemm_read_a_local",
+    2054: "gemm_dot",
     # Synchronization (3072–4095)
     3072: "wait",
     3073: "barrier",
@@ -104,6 +109,11 @@ class TraceEvent:
     # User compute (2048–3071)
     compute: tl.constexpr
     reduce: tl.constexpr
+    gemm_read: tl.constexpr
+    gemm_read_b: tl.constexpr
+    gemm_store_c: tl.constexpr
+    gemm_read_a_local: tl.constexpr
+    gemm_dot: tl.constexpr
 
     # Synchronization (3072–4095)
     wait: tl.constexpr
@@ -133,6 +143,11 @@ class TraceEvent:
         # User compute (2048–3071)
         self.compute = tl.constexpr(2048)
         self.reduce = tl.constexpr(2049)
+        self.gemm_read = tl.constexpr(2050)
+        self.gemm_read_b = tl.constexpr(2051)
+        self.gemm_store_c = tl.constexpr(2052)
+        self.gemm_read_a_local = tl.constexpr(2053)
+        self.gemm_dot = tl.constexpr(2054)
 
         # Synchronization (3072–4095)
         self.wait = tl.constexpr(3072)

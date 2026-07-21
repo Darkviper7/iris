@@ -124,6 +124,7 @@ KERNEL_CONSTEXPR_KEYS = (
     "NUM_M_TILES",          # M // block_size_m (global m-tile count)
     "TOTAL_FETCH_CELLS",    # global fetch cells (spatial mode): NUM_M_TILES*NFG_K
     "TOTAL_GEMM_TILES",     # global gemm tiles (spatial mode): NUM_M_TILES*NUM_TILES_N
+    "FETCH_WAVE",           # DEMAND-order (order 5) wave width in m-tiles (else ignored)
 )
 
 # Fetch traversal orders (FetcherLayout.order)
@@ -135,7 +136,23 @@ FETCH_ORDER_LOCAL_FIRST = "local_first"  # mtile traversal, but each m-tile's LO
 # cur_rank) % nfg_k. The flag INDEX still uses the true kfg, so the GEMM consumer
 # contract is unchanged; only producer dispatch order shifts. Coverage is identical
 # (a permutation of each m-tile's flag-groups).
-_FETCH_ORDER_CODE = {FETCH_ORDER_KFG: 0, FETCH_ORDER_MTILE: 1, FETCH_ORDER_LOCAL_FIRST: 2}
+FETCH_ORDER_PIPELINED = "pipelined"  # each WG owns a CONTIGUOUS block of cells (whole
+# m-tiles: kfg 0,1,2,.. of one m-tile in sequence), flagging each kfg as it completes.
+# The GEMM consumer waits kfg in order, so it can dot kfg0 while the producer still
+# fetches kfg1 -> real per-tile fetch/compute overlap. Uses m-tile-major mapping with a
+# contiguous (not strided) cell walk; the in-kernel FETCH_ORDER==3 branch handles both.
+FETCH_ORDER_COOP = "coop"  # stride over the REMOTE-ONLY flag list (m-major, kfg-minor):
+# adjacent fetchers cooperatively complete adjacent remote kfg of the SAME m-tile, so
+# ~NUM_FETCHERS/REMOTE_KFG m-tiles finish per wave. Delivers whole m-tiles at the width
+# the GEMM consumes them (fixes the 4-wide supply vs 12-wide demand stall at 4k).
+FETCH_ORDER_WAVE = "wave"  # DEMAND-order: wave-blocked kfg-major over the remote flags.
+# Within a block of FETCH_WAVE m-tiles (= the # of m-tiles the GEMM WG pool runs
+# concurrently, total_gemm_wg // num_tiles_n), stage remote-kfg=0 (first-needed slice)
+# for ALL wave m-tiles, then kfg=1, then kfg=2, then the next wave. This matches the
+# GEMM's actual flag-demand order (all first-wave m-tiles want their first remote slice
+# up front), eliminating the k_fg=1 stall wave that coop/mtile leave.
+_FETCH_ORDER_CODE = {FETCH_ORDER_KFG: 0, FETCH_ORDER_MTILE: 1, FETCH_ORDER_LOCAL_FIRST: 2,
+                     FETCH_ORDER_PIPELINED: 3, FETCH_ORDER_COOP: 4, FETCH_ORDER_WAVE: 5}
 
 
 @dataclass
@@ -442,9 +459,15 @@ class ScheduleLayout:
         fm = self.xcd.cu.fetcher.m
         fk = self.xcd.cu.fetcher.k
         m0 = 0 if g["spatial"] else xcd * g["slab_m"]
-        if self.xcd.cu.fetcher.order in (FETCH_ORDER_MTILE, FETCH_ORDER_LOCAL_FIRST):
+        if self.xcd.cu.fetcher.order in (FETCH_ORDER_MTILE, FETCH_ORDER_LOCAL_FIRST,
+                                         FETCH_ORDER_PIPELINED, FETCH_ORDER_COOP,
+                                         FETCH_ORDER_WAVE):
+            # COOP shares the same host COVERAGE as mtile (m-major over the full cell
+            # space); its remote-only dense delivery reordering is a KERNEL-only effect
+            # (FETCH_ORDER==4) that doesn't change which flags get staged, only when.
             fp_m = cell // nfg_k   # m-tile advances slowest
-            kfg = cell % nfg_k     # local_first rotates this by cur_rank in-kernel
+            kfg = cell % nfg_k     # local_first rotates this by cur_rank in-kernel;
+                                   # pipelined only changes the per-WG WALK, not this map
         else:
             fp_m = cell % rm       # flag-group advances slowest (kfg-major)
             kfg = cell // rm
@@ -490,7 +513,11 @@ class ScheduleLayout:
             # cell/tile index = role_xcd * pool + slot.
             if xcd < g["fetch_xcds"]:
                 fwg = xcd * g["n_fetch_wg"] + slot
-                a = self._fetch_cell(xcd, fwg, g, problem)
+                if self.xcd.cu.fetcher.order == FETCH_ORDER_PIPELINED:
+                    cpf = ceil_div(g["total_fetch_cells"], g["n_fetch_total"])
+                    a = self._fetch_cell(xcd, fwg * cpf, g, problem)
+                else:
+                    a = self._fetch_cell(xcd, fwg, g, problem)
             else:
                 gxcd = xcd - g["fetch_xcds"]
                 gwg = gxcd * g["n_gemm_wg"] + slot
@@ -525,7 +552,13 @@ class ScheduleLayout:
                     if slot >= n_fetch_wg:
                         continue  # idle WG (pool smaller than max role pool)
                     fwg = xcd * n_fetch_wg + slot
-                    for cell in range(fwg, g["total_fetch_cells"], g["n_fetch_total"]):
+                    if self.xcd.cu.fetcher.order == FETCH_ORDER_PIPELINED:
+                        # contiguous block per fetcher (mirrors in-kernel FETCH_ORDER==3)
+                        cpf = ceil_div(g["total_fetch_cells"], g["n_fetch_total"])
+                        cells = range(fwg * cpf, min((fwg + 1) * cpf, g["total_fetch_cells"]))
+                    else:
+                        cells = range(fwg, g["total_fetch_cells"], g["n_fetch_total"])
+                    for cell in cells:
                         a = self._fetch_cell(xcd, cell, g, problem)
                         a.pid = pid
                         out.append(a)
@@ -554,6 +587,66 @@ class ScheduleLayout:
                     a.pid = pid
                     out.append(a)
         return out
+
+    # ---- nested (CuTe-style) composition view of the fetch schedule --------
+    def compose(self, problem: Problem) -> dict:
+        """Express the fetch schedule as an explicit NESTED tiling, inner->outer:
+
+            FetcherLayout (m x k cells one WG walks)   -- the "value" tile
+              tiled by CULayout.spatial (the CU pool)  -- the "thread"/CU dim
+                placed by XCDLayout onto A's cell grid -- WHERE on A
+
+        This is the composition ``(CULayout.spatial  X  FetcherLayout)`` read as a
+        CuTe thread x value layout. It does NOT change the kernel or the flat
+        constexpr contract; it is a GPU-free re-view of exactly the same cell
+        coverage that :meth:`materialize` produces, usable for the slide, static
+        analysis, and the cost model's dependency graph.
+
+        Returns a dict:
+            xcds       : list of fetch-XCD ids
+            spatial    : CU-pool size per XCD (concurrent fetch WGs)
+            temporal   : passes each CU-slot serializes (max over slots)
+            fetcher    : (m, k) footprint of one cell
+            tiles[(xcd, cu_slot)] = [ (m_tile, k_flag_group), ... ]   # in walk order
+
+        The union over all (xcd, cu_slot) of these (m_tile, kfg) pairs is IDENTICAL
+        to the fetch cells in :meth:`materialize` (asserted by the coverage test).
+        """
+        g = self._geometry(problem)
+        spatial = g["n_fetch_wg"]                 # CU pool per XCD
+        fk = self.xcd.cu.fetcher.k
+        fm = self.xcd.cu.fetcher.m
+        xcds = list(range(g["fetch_xcds"])) if g["spatial"] else list(range(self.num_xcds))
+
+        tiles: dict = {}
+        max_pass = 0
+        for xcd in xcds:
+            for cu_slot in range(spatial):
+                # the flat cell indices this CU-slot walks (its "temporal" passes),
+                # mirroring materialize()'s strided loop exactly.
+                if g["spatial"]:
+                    fwg = xcd * spatial + cu_slot
+                    if self.xcd.cu.fetcher.order == FETCH_ORDER_PIPELINED:
+                        cpf = ceil_div(g["total_fetch_cells"], g["n_fetch_total"])
+                        cell_idxs = range(fwg * cpf,
+                                          min((fwg + 1) * cpf, g["total_fetch_cells"]))
+                    else:
+                        cell_idxs = range(fwg, g["total_fetch_cells"], g["n_fetch_total"])
+                else:
+                    cell_idxs = range(cu_slot, g["fetch_slots_per_xcd"], spatial)
+                walk = []
+                n_cells = 0
+                for cell in cell_idxs:
+                    n_cells += 1
+                    a = self._fetch_cell(xcd, cell, g, problem)
+                    # a fetch cell footprint spans FETCH_M m-tiles x 1 flag-group;
+                    # expand to the (m_tile, kfg) pairs it actually covers.
+                    for fi_m in range(fm):
+                        walk.append((a.m_tile + fi_m, a.k_flag_group))
+                tiles[(xcd, cu_slot)] = walk
+                max_pass = max(max_pass, n_cells)   # temporal = cells one CU-slot serializes
+        return dict(xcds=xcds, spatial=spatial, temporal=max_pass,
+                    fetcher=(fm, fk), tiles=tiles)
 
     # ---- the flat constexpr contract the kernel consumes -------------------
     def constexprs(self, problem: Problem) -> dict:
@@ -599,6 +692,12 @@ class ScheduleLayout:
             "FETCH_XCDS": g["fetch_xcds"],  # 0 = co-located
             "TOTAL_FETCH_CELLS": g["total_fetch_cells"],
             "TOTAL_GEMM_TILES": g["total_gemm_tiles"],
+            # DEMAND-order (FETCH_ORDER_WAVE) wave width = # of m-tiles the GEMM WG pool
+            # runs concurrently (total gemm WGs / N-tiles). Only used by order 5; other
+            # orders ignore it. >=1.
+            "FETCH_WAVE": max(1, (g["n_gemm_wg"] * (self.num_xcds - g["fetch_xcds"])
+                                  if g["spatial"] else g["n_gemm_wg"] * self.num_xcds)
+                             // max(1, problem.num_tiles_n)),
         }
 
     # ---- correctness invariants -------------------------------------------
@@ -768,21 +867,31 @@ def default_layout(
     group_m: Optional[int] = None,
     n_fetch_wg: Optional[int] = None,
     n_gemm_wg: Optional[int] = None,
-    order: str = FETCH_ORDER_KFG,
+    order: str = FETCH_ORDER_MTILE,
     fetch_xcds: Optional[int] = None,
 ) -> Tuple[ScheduleLayout, Problem]:
     """Derive a valid layout from the shape alone (no champion data).
 
-    Picks divisible knobs so all divisibility asserts hold. ``fetch_k`` is the
-    k-blocks-per-flag handoff granularity (a divisor of num_k_blocks); when None
-    it defaults to the largest divisor <= 8. ``order`` is the fetch traversal
-    (``"kfg"`` | ``"mtile"``). ``fetch_xcds`` selects co-located (None) vs spatial
-    role segregation. ``n_fetch_wg`` / ``n_gemm_wg`` are the WG-pool sizes; None =
-    full pool.
+    Picks divisible knobs so all divisibility asserts hold. Defaults reflect the
+    tuning campaign's findings (see work-wiki log/design):
+
+    - ``order`` defaults to ``"mtile"`` (m-tile-major): a strict win over ``"kfg"``
+      at every shape measured -- a GEMM tile gets its full K staged before it runs.
+    - ``fetch_k`` (k-blocks per flag) defaults to the largest divisor of
+      num_k_blocks ``<= 16`` (large-K shapes want fk16; small-K fall back to fk4/8).
+    - ``fetch_xcds`` defaults to ``None`` (co-located): the safe, always-divisible
+      general default. SPATIAL role-segregation (``fetch_xcds=2``) WINS at small/mid
+      shapes (<= ~4096^3) and co-located wins at large -- the crossover is
+      world-size/AI-dependent (AI-sweep, ws=4), so it is NOT baked in here. Pass
+      ``fetch_xcds=2`` explicitly for small/mid shapes to get that win.
+
+    ``n_fetch_wg`` / ``n_gemm_wg`` are the WG-pool sizes; None = full pool. This is a
+    GOOD default (right order + handoff grain), not the fully-tuned winner (which
+    also uses small pools + spatial); enumerate_layouts + a sweep finds that.
     """
     num_k_blocks = K // block_size_k
     if fetch_k is None:
-        fetch_k = _largest_divisor_at_most(num_k_blocks, 8)
+        fetch_k = _largest_divisor_at_most(num_k_blocks, 16)
     assert num_k_blocks % fetch_k == 0, "fetch_k must divide num_k_blocks"
 
     num_m_tiles = M // block_size_m
@@ -892,8 +1001,8 @@ def enumerate_layouts(
     n_fetch_wg: Optional[Tuple[int, ...]] = None,
     n_gemm_wg: Optional[Tuple[int, ...]] = None,
     cus_per_xcd: Optional[int] = None,
-    order: Tuple[str, ...] = (FETCH_ORDER_KFG,),
-    fetch_xcds: Tuple[Optional[int], ...] = (None,),
+    order: Tuple[str, ...] = (FETCH_ORDER_KFG, FETCH_ORDER_MTILE),
+    fetch_xcds: Tuple[Optional[int], ...] = (None, 1, 2, 3, 4),
     num_warps: Tuple[int, ...] = (8,),
     num_stages: Tuple[int, ...] = (2,),
 ) -> Iterator[LayoutCandidate]:
@@ -911,7 +1020,17 @@ def enumerate_layouts(
                          (one WG per cell). Values capped to [1, fetch_slots].
       n_gemm_wg          persistent gemm WG-pool size per XCD; None = full pool.
                          Values capped to [1, gemm_slots].
+      order              fetch traversal; defaults to BOTH (kfg, mtile).
+      fetch_xcds         role mode; defaults to the FULL set (None=co-located plus
+                         spatial 1..4). i.e. the defaults span the whole schedule
+                         space (mtile + spatial), where the winners live.
       num_warps/stages   launch knobs (not part of the schedule)
+
+    NOTE: the order/fetch_xcds defaults span the schedule AXES, but pools stay at
+    full (n_fetch_wg/n_gemm_wg=None) by default -- the tuned winners use SMALL pools
+    (e.g. nfw8/ngw32), so to reach them pass pool tuples + ``cus_per_xcd``. Flipping
+    pool axes to defaults too would explode the space (~182 -> 1820 with just
+    order/fetch_xcds at 4096^3; ~22k if pools are also swept).
 
     cus_per_xcd: if set, only emit pool splits with n_fetch_wg + n_gemm_wg <=
     cus_per_xcd (deadlock-safe co-residency at occupancy 1). MI300X ~38.

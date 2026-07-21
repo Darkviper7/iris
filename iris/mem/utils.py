@@ -13,16 +13,25 @@ import triton
 import triton.language as tl
 from triton.language.target_info import is_hip_cdna3, is_hip_cdna4
 
+# Import the two HIP intrinsics INDEPENDENTLY: some Triton builds ship
+# ``memrealtime`` (needed for trace timestamps) but not ``smid`` (CU id). Importing
+# them together would stub out the working one when only the other is missing.
 try:
     from triton.language.extra.hip import memrealtime as _memrealtime
+
+    _HAS_MEMREALTIME = True
+except ImportError:
+    _HAS_MEMREALTIME = False
+
+try:
     from triton.language.extra.hip import smid as _smid
 
-    _HAS_HIP_INTRINSICS = True
+    _HAS_SMID = True
 except ImportError:
-    _HAS_HIP_INTRINSICS = False
+    _HAS_SMID = False
 
 
-if _HAS_HIP_INTRINSICS:
+if _HAS_MEMREALTIME:
 
     @triton.jit
     def read_realtime():
@@ -39,6 +48,16 @@ if _HAS_HIP_INTRINSICS:
             int64: Current timestamp in cycles (100 MHz constant clock)
         """
         return _memrealtime()
+else:
+
+    @triton.jit
+    def read_realtime():
+        """Fallback stub when HIP intrinsics are missing."""
+        tl.static_assert(False, "memrealtime is unavailable in this Triton build")
+        return tl.cast(0, tl.int64)
+
+
+if _HAS_SMID:
 
     @triton.jit
     def get_cu_id():
@@ -56,15 +75,15 @@ if _HAS_HIP_INTRINSICS:
 else:
 
     @triton.jit
-    def read_realtime():
-        """Fallback stub when HIP intrinsics are missing."""
-        tl.static_assert(False, "memrealtime is unavailable in this Triton build")
-        return tl.cast(0, tl.int64)
-
-    @triton.jit
     def get_cu_id():
-        """Fallback stub when HIP intrinsics are missing."""
-        tl.static_assert(False, "smid is unavailable in this Triton build")
+        """
+        Fallback when ``smid`` is unavailable in this Triton build.
+
+        Returns 0 rather than asserting: cu_id is recorded into the trace buffer
+        for display only, and the trace reconstruction (``_extract_wg_trace``) keys
+        off xcc_id + timestamps, never cu_id. Failing hard here would disable ALL
+        device tracing on builds that lack smid but do have memrealtime.
+        """
         return tl.cast(0, tl.int32)
 
 
